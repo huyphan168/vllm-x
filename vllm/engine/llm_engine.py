@@ -16,9 +16,10 @@ from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig,
                          PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         SpeculativeConfig, ControlVectorConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
                                  SchedulerOutputs)
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -224,6 +225,7 @@ class LLMEngine:
         decoding_config: Optional[DecodingConfig],
         observability_config: Optional[ObservabilityConfig],
         prompt_adapter_config: Optional[PromptAdapterConfig],
+        control_vector_config: Optional[ControlVectorConfig],
         executor_class: Type[ExecutorBase],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -238,7 +240,8 @@ class LLMEngine:
             "override_neuron_config=%s, "
             "rope_scaling=%r, rope_theta=%r, tokenizer_revision=%s, "
             "trust_remote_code=%s, dtype=%s, max_seq_len=%d, "
-            "download_dir=%r, load_format=%s, tensor_parallel_size=%d, "
+            "return_hidden_states=%s, download_dir=%r, "
+            "load_format=%s, tensor_parallel_size=%d, "
             "pipeline_parallel_size=%d, "
             "disable_custom_all_reduce=%s, quantization=%s, "
             "enforce_eager=%s, kv_cache_dtype=%s, "
@@ -263,6 +266,7 @@ class LLMEngine:
             model_config.trust_remote_code,
             model_config.dtype,
             model_config.max_model_len,
+            model_config.return_hidden_states,
             load_config.download_dir,
             load_config.load_format,
             parallel_config.tensor_parallel_size,
@@ -302,6 +306,7 @@ class LLMEngine:
         self.prompt_adapter_config = prompt_adapter_config
         self.observability_config = observability_config or ObservabilityConfig(
         )
+        self.control_vector_config = control_vector_config
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
@@ -343,6 +348,7 @@ class LLMEngine:
             load_config=load_config,
             prompt_adapter_config=prompt_adapter_config,
             observability_config=self.observability_config,
+            control_vector_config=control_vector_config
         )
 
         if not self.model_config.embedding_mode:
@@ -641,6 +647,7 @@ class LLMEngine:
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
         trace_headers: Optional[Mapping[str, str]] = None,
+        control_vector_request: ControlVectorRequest = None,
         priority: int = 0,
     ) -> None:
         self._validate_model_inputs(processed_inputs)
@@ -673,6 +680,7 @@ class LLMEngine:
                 trace_headers=trace_headers,
                 prompt_adapter_request=prompt_adapter_request,
                 encoder_seq=encoder_seq,
+                control_vector_request=control_vector_request,
                 priority=priority)
         elif isinstance(params, PoolingParams):
             seq_group = self._create_sequence_group_with_pooling(
@@ -683,6 +691,7 @@ class LLMEngine:
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
                 encoder_seq=encoder_seq,
+                control_vector_request=control_vector_request,
                 priority=priority)
         else:
             raise ValueError(
@@ -710,6 +719,7 @@ class LLMEngine:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: int = 0,
     ) -> None:
         ...
@@ -722,6 +732,7 @@ class LLMEngine:
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
@@ -741,6 +752,7 @@ class LLMEngine:
             lora_request: Optional[LoRARequest] = None,
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            control_vector_request: Optional[ControlVectorRequest] = None,
             priority: int = 0,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
@@ -819,6 +831,7 @@ class LLMEngine:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
+            control_vector_request=control_vector_request,
             priority=priority,
         )
 
@@ -832,6 +845,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         encoder_seq: Optional[Sequence] = None,
+        control_vector_request: ControlVectorRequest = None,
         priority: int = 0,
     ) -> SequenceGroup:
         """Creates a SequenceGroup with SamplingParams."""
@@ -860,6 +874,7 @@ class LLMEngine:
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
             encoder_seq=encoder_seq,
+            control_vector_request=control_vector_request,
             priority=priority)
 
         return seq_group
@@ -873,6 +888,7 @@ class LLMEngine:
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
         encoder_seq: Optional[Sequence] = None,
+        control_vector_request: ControlVectorRequest = None,
         priority: int = 0,
     ) -> SequenceGroup:
         """Creates a SequenceGroup with PoolingParams."""
@@ -887,6 +903,7 @@ class LLMEngine:
             pooling_params=pooling_params,
             prompt_adapter_request=prompt_adapter_request,
             encoder_seq=encoder_seq,
+            control_vector_request=control_vector_request,
             priority=priority)
         return seq_group
 
@@ -1047,17 +1064,11 @@ class LLMEngine:
         assert len(seq_group_metadata_list) == len(
             scheduler_outputs.scheduled_seq_groups)
 
-        has_multiple_outputs: bool = len(outputs) > 1
-        if has_multiple_outputs:
-            assert self.scheduler_config.is_multi_step or \
-                     self.speculative_config
-            # Organize outputs by [step][sequence group] instead of
-            # [sequence group][step].
+        # Organize outputs by [step][sequence group] instead of
+        # [sequence group][step].
+        if len(outputs) > 1:
             outputs_by_sequence_group = create_output_by_sequence_group(
                 outputs, num_seq_groups=len(seq_group_metadata_list))
-            # We have outputs for multiple steps submitted in a single burst,
-            # so invalidate is_first_step_output.
-            is_first_step_output = None
         else:
             outputs_by_sequence_group = outputs
 
@@ -1086,14 +1097,13 @@ class LLMEngine:
 
             seq_group_meta = seq_group_metadata_list[i]
             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
-
             seq_group = scheduled_seq_group.seq_group
 
             if seq_group.is_finished():
                 finished_before.append(i)
                 continue
 
-            if has_multiple_outputs:
+            if len(outputs) > 1:
                 output = outputs_by_sequence_group[i]
             else:
                 output = [outputs_by_sequence_group[0][i]]
@@ -1125,6 +1135,9 @@ class LLMEngine:
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, output)
             else:
+                if self.model_config.return_hidden_states:
+                    self.output_processor.process_hidden_states(
+                        seq_group, output)
                 self.output_processor.process_prompt_logprob(seq_group, output)
                 if seq_group_meta.do_sample:
                     self.output_processor.process_outputs(

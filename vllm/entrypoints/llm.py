@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import (Any, ClassVar, Dict, List, Optional, Sequence, Tuple,
                     Union, cast, overload)
 
+from vllm.control_vectors.request import ControlVectorRequest
 from tqdm import tqdm
 
 from vllm.engine.arg_utils import EngineArgs
@@ -320,6 +321,7 @@ class LLM:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: Optional[List[int]] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -385,6 +387,7 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             guided_options=guided_options_request,
+            control_vector_request=control_vector_request,
             priority=priority)
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
@@ -790,6 +793,7 @@ class LLM:
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
         prompt_adapter_request: Optional[PromptAdapterRequest],
         guided_options: Optional[GuidedDecodingRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: Optional[List[int]] = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
@@ -829,6 +833,7 @@ class LLM:
         params: Union[SamplingParams, PoolingParams],
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -838,6 +843,7 @@ class LLM:
             params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
+            control_vector_request=control_vector_request,
             priority=priority,
         )
 

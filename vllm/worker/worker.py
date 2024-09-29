@@ -7,7 +7,7 @@ import torch
 import torch.distributed
 
 import vllm.envs as envs
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig, ControlVectorConfig,
                          ModelConfig, ObservabilityConfig, ParallelConfig,
                          PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig)
@@ -23,6 +23,7 @@ from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
@@ -54,6 +55,7 @@ class Worker(LocalOrDistributedWorkerBase):
         lora_config: Optional[LoRAConfig] = None,
         speculative_config: Optional[SpeculativeConfig] = None,
         prompt_adapter_config: Optional[PromptAdapterConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
         observability_config: Optional[ObservabilityConfig] = None,
@@ -70,6 +72,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self.lora_config = lora_config
         self.load_config = load_config
         self.prompt_adapter_config = prompt_adapter_config
+        self.control_vector_config = control_vector_config
         self.is_driver_worker = is_driver_worker
         if parallel_config and is_driver_worker:
             assert rank % parallel_config.tensor_parallel_size == 0, \
@@ -80,14 +83,17 @@ class Worker(LocalOrDistributedWorkerBase):
             init_cached_hf_modules()
         self.observability_config = observability_config
 
+        additional_args = {}
         # Return hidden states from target model if the draft model is an
-        # mlp_speculator
-        speculative_args = {} if speculative_config is None \
-            or (speculative_config.draft_model_config.model ==
-                model_config.model) \
-            or (speculative_config.draft_model_config.hf_config.model_type
-                not in ["medusa", "mlp_speculator", "eagle"]) \
-                    else {"return_hidden_states": True}
+        # mlp_speculator or the model config requests hidden states.
+        if (
+            speculative_config is not None
+            and speculative_config.draft_model_config.model != \
+                    model_config.model
+            and speculative_config.draft_model_config.hf_config.model_type in \
+                    ["medusa", "mlp_speculator", "eagle"]
+        ) or model_config.return_hidden_states:
+            additional_args["return_hidden_states"] = True
 
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if model_runner_cls is not None:
@@ -107,8 +113,9 @@ class Worker(LocalOrDistributedWorkerBase):
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
             prompt_adapter_config=prompt_adapter_config,
+            control_vector_config=control_vector_config,
             observability_config=observability_config,
-            **speculative_args,
+            **additional_args,
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
@@ -420,6 +427,13 @@ class Worker(LocalOrDistributedWorkerBase):
     def list_prompt_adapters(self) -> Set[int]:
         return self.model_runner.list_prompt_adapters()
 
+    def add_control_vector(
+            self, control_vector_request: ControlVectorRequest) -> bool:
+        return self.model_runner.add_control_vector(control_vector_request)
+
+    def remove_control_vector(self, cv_id: int) -> bool:
+        return self.model_runner.remove_control_vector(cv_id)
+    
     @property
     def max_model_len(self) -> int:
         return self.model_config.max_model_len

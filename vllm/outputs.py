@@ -4,6 +4,8 @@ from typing import List, Optional
 from typing import Sequence as GenericSequence
 from typing import Union
 
+from torch import Tensor
+
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind
 from vllm.sequence import (PromptLogprobs, RequestMetrics, SampleLogprobs,
@@ -27,6 +29,7 @@ class CompletionOutput:
             to stop, None if the completion finished for some other reason
             including encountering the EOS token.
         lora_request: The LoRA request that was used to generate the output.
+        hidden_states: The model hidden states for the completion tokens.
     """
 
     index: int
@@ -37,6 +40,7 @@ class CompletionOutput:
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
+    hidden_states: Optional[Tensor] = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -48,7 +52,10 @@ class CompletionOutput:
                 f"cumulative_logprob={self.cumulative_logprob}, "
                 f"logprobs={self.logprobs}, "
                 f"finish_reason={self.finish_reason}, "
-                f"stop_reason={self.stop_reason})")
+                f"stop_reason={self.stop_reason}, "
+                "hidden_states="
+                f"Tensor({self.hidden_states.shape}))"
+                if self.hidden_states is not None else "None)")
 
 
 @dataclass
@@ -87,6 +94,8 @@ class RequestOutput:
                         None if decoder-only
         encoder_prompt_token_ids: The token IDs of the encoder prompt;
                                   None if decoder-only
+        prompt_hidden_states: Model hidden states for the request prompt
+                                tokens.
     """
 
     def __init__(
@@ -101,6 +110,7 @@ class RequestOutput:
         lora_request: Optional[LoRARequest] = None,
         encoder_prompt: Optional[str] = None,
         encoder_prompt_token_ids: Optional[List[int]] = None,
+        prompt_hidden_states: Optional[Tensor] = None,
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
@@ -112,6 +122,7 @@ class RequestOutput:
         self.lora_request = lora_request
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
+        self.prompt_hidden_states = prompt_hidden_states
 
     @classmethod
     def from_seq_group(cls, seq_group: SequenceGroup,
@@ -154,102 +165,41 @@ class RequestOutput:
         # NOTE: We need omit logprobs here explicitly because the sequence
         # always has the logprobs of the sampled tokens even if the
         # logprobs are not requested.
-        include_logprobs = sampling_params.logprobs is not None
-        text_buffer_length = sampling_params.output_text_buffer_length
-        delta = sampling_params.output_kind == RequestOutputKind.DELTA
-
-        outputs = []
-        include_prompt = True
-        for i, seq in enumerate(top_n_seqs):
-            output_text = seq.get_output_text_to_return(
-                text_buffer_length, delta)
-
-            output_token_ids = seq.get_output_token_ids_to_return(delta)
-            num_output_tokens = 1 if isinstance(output_token_ids,
-                                                int) else len(output_token_ids)
-
-            output_logprobs = seq.output_logprobs if include_logprobs else None
-
-            if delta:
-                # Slice logprobs delta if applicable
-                if output_logprobs:
-                    output_logprobs = output_logprobs[-num_output_tokens:]
-                # Don't include prompt if this is after the first output
-                # containing decode token ids
-                if include_prompt and seq.get_output_len() > num_output_tokens:
-                    include_prompt = False
-
-            if use_cache:
-                # Get cached output object
-                cached_outputs = seq_group.cached_request_output.outputs  # type: ignore
-                if i >= len(cached_outputs):
-                    cached_outputs.append(
-                        CompletionOutput(index=i,
-                                         text="",
-                                         token_ids=[],
-                                         cumulative_logprob=None,
-                                         logprobs=None,
-                                         finish_reason=None,
-                                         stop_reason=None))
-                output = cached_outputs[i]
-
-                # Init cached output object
-                assert output.index == i
-                output.text = output_text
-
-                if isinstance(output_token_ids, int):
-                    output.token_ids.clear()
-                    output.token_ids.append(output_token_ids)
-                else:
-                    output.token_ids = output_token_ids
-
-                output.cumulative_logprob = seq.get_cumulative_logprob() \
-                    if include_logprobs else None
-                output.logprobs = output_logprobs
-                output.finish_reason = SequenceStatus.get_finished_reason(
-                    seq.status)
-                output.stop_reason = seq.stop_reason
-
-            else:
-                output = CompletionOutput(
-                    seqs.index(seq), output_text, [output_token_ids]
-                    if isinstance(output_token_ids, int) else output_token_ids,
-                    seq.get_cumulative_logprob() if include_logprobs else None,
-                    output_logprobs,
-                    SequenceStatus.get_finished_reason(seq.status),
-                    seq.stop_reason)
-
-            outputs.append(output)
+        include_logprobs = seq_group.sampling_params.logprobs is not None
+        text_buffer_length = seq_group.sampling_params.output_text_buffer_length
+        outputs = [
+            CompletionOutput(
+                seqs.index(seq),
+                seq.get_output_text_to_return(text_buffer_length),
+                seq.data._output_token_ids,
+                seq.get_cumulative_logprob() if include_logprobs else None,
+                seq.output_logprobs if include_logprobs else None,
+                SequenceStatus.get_finished_reason(seq.status),
+                seq.stop_reason,
+                hidden_states=seq.hidden_states) for seq in top_n_seqs
+        ]
 
         # Every sequence in the sequence group should have the same prompt.
-        if include_prompt:
-            prompt = seq_group.prompt
-            prompt_token_ids = seq_group.prompt_token_ids
-            encoder_prompt = seq_group.encoder_prompt
-            encoder_prompt_token_ids = seq_group.encoder_prompt_token_ids
-            prompt_logprobs = seq_group.prompt_logprobs
-        else:
-            prompt = None
-            prompt_token_ids = None
-            encoder_prompt = None
-            encoder_prompt_token_ids = None
-            prompt_logprobs = None
+        prompt = seq_group.prompt
+        prompt_token_ids = seq_group.prompt_token_ids
+        encoder_prompt = seq_group.encoder_prompt
+        encoder_prompt_token_ids = seq_group.encoder_prompt_token_ids
+        prompt_logprobs = seq_group.prompt_logprobs
+        prompt_hidden_states = seq_group.prompt_hidden_states
+        finished = seq_group.is_finished()
         finished_time = time.time() if finished else None
         seq_group.set_finished_time(finished_time)
-
-        init_args = (seq_group.request_id, prompt, prompt_token_ids,
-                     prompt_logprobs, outputs, finished, seq_group.metrics,
-                     seq_group.lora_request, encoder_prompt,
-                     encoder_prompt_token_ids)
-
-        if use_cache:
-            request_output = seq_group.cached_request_output
-            request_output.__init__(*init_args)  # type: ignore
-
-        else:
-            request_output = cls(*init_args)
-
-        return request_output
+        return cls(seq_group.request_id,
+                   prompt,
+                   prompt_token_ids,
+                   prompt_logprobs,
+                   outputs,
+                   finished,
+                   seq_group.metrics,
+                   lora_request=seq_group.lora_request,
+                   encoder_prompt=encoder_prompt,
+                   encoder_prompt_token_ids=encoder_prompt_token_ids,
+                   prompt_hidden_states=prompt_hidden_states)
 
     def __repr__(self) -> str:
         return (f"RequestOutput(request_id={self.request_id}, "
@@ -261,7 +211,10 @@ class RequestOutput:
                 f"outputs={self.outputs}, "
                 f"finished={self.finished}, "
                 f"metrics={self.metrics}, "
-                f"lora_request={self.lora_request})")
+                f"lora_request={self.lora_request})"
+                "prompt_hidden_states="
+                f"Tensor({self.prompt_hidden_states.shape}))"
+                if self.prompt_hidden_states is not None else "None)")
 
 
 class EmbeddingRequestOutput:

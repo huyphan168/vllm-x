@@ -20,6 +20,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
+from vllm.control_vectors.request import ControlVectorRequest
 
 if TYPE_CHECKING:
     from vllm.multimodal.base import MultiModalDataDict
@@ -382,6 +383,7 @@ class Sequence:
         from_decoder_prompt: Construct Sequence from LLMInputs decoder prompt
                              (True) or encoder prompt (False.) Must be True
                              for decoder-only model.
+        hidden_states: Model hidden states for sequence.
 
     """
 
@@ -394,6 +396,7 @@ class Sequence:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         from_decoder_prompt: bool = True,
+        hidden_states: Optional[torch.Tensor] = None,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = inputs
@@ -402,6 +405,9 @@ class Sequence:
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.from_decoder_prompt = from_decoder_prompt
+        self.hidden_states = hidden_states
+        self._prompt: Optional[str] = None
+        self._prompt_token_ids: Optional[List[int]] = None
 
         # For decoder-only models, a Sequence is constructed
         # from an LLMInputs instance (the `inputs` arg.)
@@ -654,7 +660,8 @@ class SequenceGroup:
                      unless you are working with an encoder/decoder model.
         trace_headers: OpenTelemetry trace headers.
         prompt_adapter_request: Prompt Adapter request.
-        priority: User-defined priority of the request.
+        prompt_hidden_states: Hidden states of the prompt of the sequence 
+                                group.
     """
 
     def __init__(
@@ -669,7 +676,8 @@ class SequenceGroup:
         encoder_seq: Optional[Sequence] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
+        control_vector_request: Optional[ControlVectorRequest] = None,
+        prompt_hidden_states: Optional[torch.Tensor] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
@@ -689,11 +697,10 @@ class SequenceGroup:
         self.embeddings = embeddings
         self.pooling_params = pooling_params
         self.prompt_adapter_request = prompt_adapter_request
+        self.control_vector_request = control_vector_request
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
-        self.priority = priority
-
-        self.cached_request_output = None
+        self.prompt_hidden_states = prompt_hidden_states
 
     @property
     def prompt(self) -> Optional[str]:
@@ -1004,6 +1011,7 @@ class SequenceGroupMetadata(
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[List[int]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
+    control_vector_request: Optional[ControlVectorRequest] = None
     token_chunk_size: Optional[int] = None
 
     ### Stateful fields that are lazily defined. ###
@@ -1035,6 +1043,11 @@ class SequenceGroupMetadata(
         return self.prompt_adapter_request.prompt_adapter_num_virtual_tokens \
                         if self.prompt_adapter_request else 0
 
+    @property
+    def control_vector_id(self) -> int:
+        return self.control_vector_request.adapter_id \
+            if self.control_vector_request else 0
+    
     # Multi-Step Chunked-Prefill property
     @property
     def is_single_step_prompt(self) -> bool:
@@ -1118,6 +1131,8 @@ class CompletionSequenceGroupOutput(
     samples: List[SequenceOutput]
     # Prompt logprob for each prompt query token.
     prompt_logprobs: Optional[PromptLogprobs]
+    prompt_hidden_states: Optional[torch.Tensor] = None
+    hidden_state: Optional[torch.Tensor] = None
 
     def __repr__(self) -> str:
         return (f"CompletionSequenceGroupOutput(samples={self.samples}, "
